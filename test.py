@@ -55,7 +55,7 @@ with torch.no_grad():
             pred[tmp_norm > 0] = (pred[tmp_norm > 0]) / tmp_norm[tmp_norm > 0]
         elif opt.dimension.startswith('2'):
             if opt.remove_bg:
-                bound = get_bounds(tmp_scans)
+                bound = get_bounds(tmp_scans)  # tmp_scans is already a numpy array
             else:
                 x1, y1, z1 = tmp_scans.shape
                 bound = [0, x1, 0, y1, 0, z1]

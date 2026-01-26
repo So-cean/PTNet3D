@@ -1,0 +1,8 @@
+**/*.pt
+**/*.ckpt
+**/*.pth
+cache/
+checkpoints/
+slurm_logs/
+**/*.png
+*/**/__pycache__

@@ -39,7 +39,7 @@ def make_dataset(dir, extension):
 def get_bounds(img):
     #img: torchio.ScalarImage.data
     #return: idx, a list containing [x_min, x_max, y_min, y_max, z_min, z_max)
-    img = np.squeeze(img.numpy())
+    img = np.squeeze(img)
     nz_idx = np.nonzero(img)
     idx = []
     for i in nz_idx:

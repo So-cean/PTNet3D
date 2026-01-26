@@ -1,3 +1,4 @@
+from multiprocessing import reduction
 import torch
 import torch.nn as nn
 import functools
@@ -72,50 +73,94 @@ def discriminate(D, fake_pool, input_label, test_image, use_pool=False):
 ##############################################################################
 # Losses
 ##############################################################################
+# class GANLoss(nn.Module):
+#     def __init__(self, use_lsgan=True, target_real_label=1.0, target_fake_label=0.0,
+#                  tensor=torch.FloatTensor):
+#         super(GANLoss, self).__init__()
+#         self.real_label = target_real_label
+#         self.fake_label = target_fake_label
+#         self.real_label_var = None
+#         self.fake_label_var = None
+#         self.Tensor = tensor
+#         if use_lsgan:
+#             self.loss = nn.MSELoss()
+#         else:
+#             self.loss = nn.BCELoss()
+
+#     def get_target_tensor(self, input, target_is_real):
+#         target_tensor = None
+#         if target_is_real:
+#             create_label = ((self.real_label_var is None) or
+#                             (self.real_label_var.numel() != input.numel()))
+#             if create_label:
+#                 real_tensor = self.Tensor(input.size()).fill_(self.real_label)
+#                 self.real_label_var = Variable(real_tensor, requires_grad=False)
+#             target_tensor = self.real_label_var
+#         else:
+#             create_label = ((self.fake_label_var is None) or
+#                             (self.fake_label_var.numel() != input.numel()))
+#             if create_label:
+#                 fake_tensor = self.Tensor(input.size()).fill_(self.fake_label)
+#                 self.fake_label_var = Variable(fake_tensor, requires_grad=False)
+#             target_tensor = self.fake_label_var
+#         return target_tensor
+
+#     def __call__(self, input, target_is_real):
+#         if isinstance(input[0], list):
+#             loss = 0
+#             for input_i in input:
+#                 pred = input_i[-1]
+#                 target_tensor = self.get_target_tensor(pred, target_is_real)
+#                 loss += self.loss(pred, target_tensor)
+#             return loss
+#         else:
+#             target_tensor = self.get_target_tensor(input[-1], target_is_real)
+#             return self.loss(input[-1], target_tensor)
 class GANLoss(nn.Module):
-    def __init__(self, use_lsgan=True, target_real_label=1.0, target_fake_label=0.0,
-                 tensor=torch.FloatTensor):
-        super(GANLoss, self).__init__()
-        self.real_label = target_real_label
-        self.fake_label = target_fake_label
-        self.real_label_var = None
-        self.fake_label_var = None
-        self.Tensor = tensor
-        if use_lsgan:
-            self.loss = nn.MSELoss()
-        else:
-            self.loss = nn.BCELoss()
+    def __init__(self, use_lsgan=True, target_real=1.0, target_fake=0.0, reduction='mean'):
+        """
+        reduction : 'mean' | 'none'
+                    'mean' -> 返回标量（兼容旧代码）
+                    'none' -> 返回 (B,) 向量（用于逐样本加权）
+        """
+        super().__init__()
+        self.reduction = reduction
+        self.register_buffer("real_label", torch.tensor(target_real))
+        self.register_buffer("fake_label", torch.tensor(target_fake))
+        # 核心 loss：不聚合版本
+        self.loss = nn.MSELoss(reduction='none') if use_lsgan else nn.BCEWithLogitsLoss(reduction='none')
 
-    def get_target_tensor(self, input, target_is_real):
-        target_tensor = None
-        if target_is_real:
-            create_label = ((self.real_label_var is None) or
-                            (self.real_label_var.numel() != input.numel()))
-            if create_label:
-                real_tensor = self.Tensor(input.size()).fill_(self.real_label)
-                self.real_label_var = Variable(real_tensor, requires_grad=False)
-            target_tensor = self.real_label_var
-        else:
-            create_label = ((self.fake_label_var is None) or
-                            (self.fake_label_var.numel() != input.numel()))
-            if create_label:
-                fake_tensor = self.Tensor(input.size()).fill_(self.fake_label)
-                self.fake_label_var = Variable(fake_tensor, requires_grad=False)
-            target_tensor = self.fake_label_var
-        return target_tensor
+    def get_target_tensor(self, pred: torch.Tensor, target_is_real: bool):
+        target_val = self.real_label if target_is_real else self.fake_label
+        return torch.full_like(pred, target_val)
 
-    def __call__(self, input, target_is_real):
+    def forward(self, input, target_is_real: bool):
+        """
+        input : 判别器输出
+                · 单尺度：Tensor
+                · 多尺度：list[list[Tensor]]  (pix2pixHD 风格)
+        target_is_real : True  -> 真实标签
+                         False -> 假标签
+        返回：
+            reduction='mean' -> 标量
+            reduction='none' -> (B,) 向量（逐样本）
+        """
+        # ----------- 多尺度判别器 -----------
         if isinstance(input[0], list):
-            loss = 0
+            batch_size = input[0][-1].size(0)          # 取第一张图 batch 维度
+            loss_vec = torch.zeros(batch_size, device=input[0][-1].device)
             for input_i in input:
-                pred = input_i[-1]
+                pred = input_i[-1]                     # 最后一层特征图
                 target_tensor = self.get_target_tensor(pred, target_is_real)
-                loss += self.loss(pred, target_tensor)
-            return loss
-        else:
-            target_tensor = self.get_target_tensor(input[-1], target_is_real)
-            return self.loss(input[-1], target_tensor)
+                # 先在空间上平均，再返回 (B,)
+                loss_vec += self.loss(pred, target_tensor).mean(dim=[1, 2, 3])
+            return loss_vec if self.reduction == 'none' else loss_vec.mean()
 
+        # ----------- 单尺度 -----------
+        pred = input[-1] if isinstance(input, list) else input
+        target_tensor = self.get_target_tensor(pred, target_is_real)
+        loss_vec = self.loss(pred, target_tensor).mean(dim=[1, 2, 3])  # [B]
+        return loss_vec if self.reduction == 'none' else loss_vec.mean()
 
 class VGGLoss(nn.Module):
     def __init__(self, gpu_ids):
@@ -132,27 +177,32 @@ class VGGLoss(nn.Module):
         return loss
 
 
-def feature_loss(opt, ori_img, syn_img, pred_real, pred_fake, ext_discriminator):
-    criterionFeat = torch.nn.L1Loss()
+def feature_loss(opt, ori_img, syn_img, pred_real, pred_fake, ext_discriminator, reduction='none'):
+    criterionFeat = torch.nn.L1Loss(reduction=reduction)
 
     if opt.dimension.startswith('2'):
-        loss_G_GAN_Feat = 0
+        B = ori_img.size(0)
+        loss_G_GAN_Feat = torch.zeros(B, device=ori_img.device)
         D_weights = 1.0 / 2
         for i in range(2):
             for j in range(len(pred_fake[i]) - 1):
-                loss_G_GAN_Feat += D_weights * \
-                                   criterionFeat(pred_fake[i][j], pred_real[i][j].detach())
+                # 逐样本 L1，再在空间上平均 → [B]
+                feat_diff = criterionFeat(pred_fake[i][j], pred_real[i][j].detach())  # [B,C,H,W]
+                loss_G_GAN_Feat += D_weights * feat_diff.mean(dim=[1, 2, 3])
+
+        # 外部 VGG 特征
         ori_img = ori_img.expand(-1, 3, -1, -1)
         syn_img = syn_img.expand(-1, 3, -1, -1)
         feat_resize = nn.Upsample(size=(224, 224))
         feat_res_real = ext_discriminator(feat_resize(ori_img))
         feat_res_fake = ext_discriminator(feat_resize(syn_img))
-        loss_G_GAN_Feat_ext = 0
+        loss_G_GAN_Feat_ext = torch.zeros(B, device=ori_img.device)
         vgg_weights = [1.0 / 32, 1.0 / 16, 1.0 / 8, 1.0 / 4, 1.0]
-
         for tmp_i in range(len(feat_res_fake)):
-            loss_G_GAN_Feat_ext += criterionFeat(feat_res_real[tmp_i].detach(), feat_res_fake[tmp_i]) * vgg_weights[tmp_i]
+            feat_diff = criterionFeat(feat_res_real[tmp_i].detach(), feat_res_fake[tmp_i])  # [B,C,H,W]
+            loss_G_GAN_Feat_ext += (feat_diff.mean(dim=[1, 2, 3]) * vgg_weights[tmp_i])
 
+        # 返回逐样本向量
         return loss_G_GAN_Feat, loss_G_GAN_Feat_ext
     elif opt.dimension.startswith('3'):
         loss_G_GAN_Feat = 0

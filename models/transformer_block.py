@@ -11,6 +11,7 @@ import torch.nn as nn
 import numpy as np
 from timm.models.layers import DropPath
 from models.token_performer import Token_performer
+# from models.token_flash import TokenFlash as Token_performer
 from unfoldNd import UnfoldNd
 
 

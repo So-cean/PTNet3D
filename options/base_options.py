@@ -22,13 +22,21 @@ class BaseOptions():
         # dataloading:
         self.parser.add_argument('--extension', type=str, default='.nii.gz', help='file extension (*.nii/*.nii.gz(')
         self.parser.add_argument('--norm_perc', type=float, default=99.95, help='intensity over norm_perc% percentile will be set as 1 while performing 0-1 normalization')
-        self.parser.add_argument('--patch_size', type=tuple, default=(64, 64, 64),
-                                 help='size of 3D patch')
+        self.parser.add_argument(
+            '--patch_size',
+            nargs='+',      # 接收 1 个或多个整数
+            type=int,
+            default=(64, 64, 64),
+            metavar='D',
+            help='patch size, give 2 ints for 2D or 3 ints for 3D: e.g. 64 64  or  64 64 64'
+        )
         self.parser.add_argument('--remove_bg', type=bool, default=True, help='whether to only sample inside the scan (non-zero), requires to have positive value for any foreground pixels')
 
         # for displays
         self.parser.add_argument('--display_winsize', type=int, default=512,  help='display size during training in ./web/index.html')
-
+        
+        # DDP related (these will be set automatically by torchrun/launch)
+        self.parser.add_argument('--local_rank', type=int, default=0, help='local rank for DDP (set by torchrun)')
 
         self.initialized = True
 
@@ -45,22 +53,30 @@ class BaseOptions():
             if id >= 0:
                 self.opt.gpu_ids.append(id)
         
-        # set gpu ids
-        if len(self.opt.gpu_ids) > 0:
+        # For DDP, use LOCAL_RANK from environment if available
+        if 'LOCAL_RANK' in os.environ:
+            local_rank = int(os.environ['LOCAL_RANK'])
+            if len(self.opt.gpu_ids) > 0:
+                torch.cuda.set_device(local_rank)
+        elif len(self.opt.gpu_ids) > 0:
             torch.cuda.set_device(self.opt.gpu_ids[0])
+            
         assert self.opt.dimension in ['2D','3D','2d','3d'], 'dimension is not supported'
 
         args = vars(self.opt)
 
-        print('------------ Options -------------')
-        for k, v in sorted(args.items()):
-            print('%s: %s' % (str(k), str(v)))
-        print('-------------- End ----------------')
+        # Only print on main process (rank 0 or single GPU)
+        is_main = not ('RANK' in os.environ) or int(os.environ.get('RANK', 0)) == 0
+        if is_main:
+            print('------------ Options -------------')
+            for k, v in sorted(args.items()):
+                print('%s: %s' % (str(k), str(v)))
+            print('-------------- End ----------------')
 
         # save to the disk        
         expr_dir = os.path.join(self.opt.checkpoints_dir, self.opt.name)
         util.mkdirs(expr_dir)
-        if save :
+        if save and is_main:
             file_name = os.path.join(expr_dir, 'opt.txt')
             with open(file_name, 'wt') as opt_file:
                 opt_file.write('------------ Options -------------\n')
