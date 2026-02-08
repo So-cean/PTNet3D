@@ -8,19 +8,37 @@ import os
 # Converts a Tensor into a Numpy array
 # |imtype|: the desired type of the converted numpy array
 def tensor2im(image_tensor, imtype=np.uint8, normalize=True):
+    """增强版的张量转图像函数"""
+    # 处理列表输入
     if isinstance(image_tensor, list):
-        image_numpy = []
-        for i in range(len(image_tensor)):
-            image_numpy.append(tensor2im(image_tensor[i], imtype, normalize))
-        return image_numpy
-    image_numpy = image_tensor.cpu().float().numpy()
+        return [tensor2im(tensor, imtype, normalize) for tensor in image_tensor]
+    
+    # 确保是PyTorch张量
+    if not isinstance(image_tensor, torch.Tensor):
+        return image_tensor  # 如果不是张量，直接返回
+    
+    # 安全分离张量
+    with torch.no_grad():  # 确保不计算梯度
+        if image_tensor.requires_grad:
+            image_tensor = image_tensor.detach()
+        
+        # 移动到CPU并转换
+        image_numpy = image_tensor.cpu().float().numpy()
+    
+    # 后续处理保持不变
+    if image_numpy.ndim == 4:  # [B, C, H, W] -> 取第一个
+        image_numpy = image_numpy[0]
+    
     if normalize:
         image_numpy = (np.transpose(image_numpy, (1, 2, 0)) + 1) / 2.0 * 255.0
     else:
-        image_numpy = np.transpose(image_numpy, (1, 2, 0)) * 255.0      
+        image_numpy = np.transpose(image_numpy, (1, 2, 0)) * 255.0
+    
     image_numpy = np.clip(image_numpy, 0, 255)
+    
     if image_numpy.shape[2] == 1 or image_numpy.shape[2] > 3:        
         image_numpy = image_numpy[:,:,0]
+    
     return image_numpy.astype(imtype)
 
 # Converts a one-hot tensor into a colorful label map
@@ -46,8 +64,7 @@ def mkdirs(paths):
         mkdir(paths)
 
 def mkdir(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
+    os.makedirs(path, exist_ok=True)
 
 ###############################################################################
 # Code from

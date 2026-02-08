@@ -39,23 +39,44 @@ def get_norm_layer(norm_type='instance'):
     return norm_layer
 
 
+# def define_D(input_nc, ndf, n_layers_D, norm='instance', use_sigmoid=False, num_D=1, getIntermFeat=False, gpu_ids=[]):
+#     norm_layer = get_norm_layer(norm_type=norm)
+#     netD = MultiscaleDiscriminator(input_nc, ndf, n_layers_D, norm_layer, use_sigmoid, num_D, getIntermFeat)
+#     if len(gpu_ids) > 0:
+#         assert (torch.cuda.is_available())
+#         netD.cuda(gpu_ids[0])
+
+#     netD.apply(weights_init)
+#     return netD
 def define_D(input_nc, ndf, n_layers_D, norm='instance', use_sigmoid=False, num_D=1, getIntermFeat=False, gpu_ids=[]):
     norm_layer = get_norm_layer(norm_type=norm)
     netD = MultiscaleDiscriminator(input_nc, ndf, n_layers_D, norm_layer, use_sigmoid, num_D, getIntermFeat)
-    print(netD)
-    if len(gpu_ids) > 0:
-        assert (torch.cuda.is_available())
-        netD.cuda(gpu_ids[0])
+    
+    # 修复：自适应设备选择，不进行DDP包装
+    if len(gpu_ids) > 0 and torch.cuda.is_available():
+        # 确保gpu_ids中的设备实际存在
+        available_gpus = list(range(torch.cuda.device_count()))
+        valid_gpu_ids = [gpu_id for gpu_id in gpu_ids if gpu_id in available_gpus]
+        
+        if len(valid_gpu_ids) > 0:
+            # 只将模型移动到第一个GPU，不进行并行包装
+            netD = netD.cuda(valid_gpu_ids[0])
+            print(f"使用GPU: {valid_gpu_ids[0]} (后续进行DDP包装)")
+        else:
+            print("指定的GPU不可用，回退到CPU")
+            gpu_ids = []  # 清空GPU ID列表
+    else:
+        print("CUDA不可用或未指定GPU，使用CPU")
+        gpu_ids = []  # 确保使用CPU
 
     netD.apply(weights_init)
     return netD
-
 
 def define_D_3D(input_nc, ndf, n_layers_D, norm='instance3D', use_sigmoid=False, num_D=1, getIntermFeat=False,
                 gpu_ids=[]):
     norm_layer = get_norm_layer(norm_type=norm)
     netD = MultiscaleDiscriminator3D(input_nc, ndf, n_layers_D, norm_layer, use_sigmoid, num_D, getIntermFeat)
-    print(netD)
+    # print(netD)
     if len(gpu_ids) > 0:
         assert (torch.cuda.is_available())
         netD.cuda(gpu_ids[0])
@@ -162,47 +183,110 @@ class GANLoss(nn.Module):
         loss_vec = self.loss(pred, target_tensor).mean(dim=[1, 2, 3])  # [B]
         return loss_vec if self.reduction == 'none' else loss_vec.mean()
 
-class VGGLoss(nn.Module):
-    def __init__(self, gpu_ids):
-        super(VGGLoss, self).__init__()
-        self.vgg = Vgg19().cuda()
-        self.criterion = nn.L1Loss()
-        self.weights = [1.0 / 32, 1.0 / 16, 1.0 / 8, 1.0 / 4, 1.0]
+# class VGGLoss(nn.Module):
+#     def __init__(self, gpu_ids):
+#         super(VGGLoss, self).__init__()
+#         device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+#         self.vgg = Vgg19().to(device)
+#         self.criterion = nn.L1Loss()
+#         self.weights = [1.0 / 32, 1.0 / 16, 1.0 / 8, 1.0 / 4, 1.0]
 
+#     def forward(self, x, y):
+#         x_vgg, y_vgg = self.vgg(x), self.vgg(y)
+#         loss = 0
+#         for i in range(len(x_vgg)):
+#             loss += self.weights[i] * self.criterion(x_vgg[i], y_vgg[i].detach())
+#         return loss
+class VGGLoss(nn.Module):
+    """
+    VGG感知loss
+    支持输入：[-1, 1] 或 [0, 1] 范围的图像
+    """
+    def __init__(self, gpu_ids=None, input_range='tanh'):
+        super(VGGLoss, self).__init__()
+        
+        # 加载预训练VGG19，只取features部分
+        vgg = models.vgg19(pretrained=True)
+        self.vgg_layers = vgg.features[:36]  # 到relu5_4
+        self.vgg_layers.eval()
+        
+        # 冻结
+        for param in self.vgg_layers.parameters():
+            param.requires_grad = False
+        
+        # L1 loss
+        self.criterion = nn.L1Loss()
+        
+        # ImageNet归一化参数
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        
+        # 输入范围类型
+        self.input_range = input_range  # 'tanh' for [-1,1], 'sigmoid' for [0,1]
+        
+        print(f"✅ VGG Loss initialized (input_range={input_range})")
+    
+    def normalize(self, x):
+        """归一化为ImageNet标准"""
+        # 如果输入是 [-1, 1]，先转换到 [0, 1]
+        if self.input_range == 'tanh':
+            x = (x + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+            x = torch.clamp(x, 0, 1)  # 确保范围
+        
+        # 单通道→3通道
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+        
+        # 移动mean/std到正确设备
+        if self.mean.device != x.device:
+            self.mean = self.mean.to(x.device)
+            self.std = self.std.to(x.device)
+        
+        # ImageNet归一化: (x - mean) / std
+        return (x - self.mean) / self.std
+    
     def forward(self, x, y):
-        x_vgg, y_vgg = self.vgg(x), self.vgg(y)
-        loss = 0
-        for i in range(len(x_vgg)):
-            loss += self.weights[i] * self.criterion(x_vgg[i], y_vgg[i].detach())
+        """
+        x: 预测 (根据input_range，可以是[-1,1]或[0,1])
+        y: 目标 (根据input_range，可以是[-1,1]或[0,1])
+        """
+        # 归一化到ImageNet标准
+        x = self.normalize(x)
+        y = self.normalize(y)
+        
+        # 提取特征
+        x_features = self.vgg_layers(x)
+        
+        with torch.no_grad():
+            y_features = self.vgg_layers(y)
+        
+        # 计算loss
+        loss = self.criterion(x_features, y_features)
+        
         return loss
 
 
-def feature_loss(opt, ori_img, syn_img, pred_real, pred_fake, ext_discriminator, reduction='none'):
+def feature_loss(opt, ori_img, syn_img, pred_real, pred_fake, ext_discriminator, reduction='mean'):
     criterionFeat = torch.nn.L1Loss(reduction=reduction)
 
     if opt.dimension.startswith('2'):
-        B = ori_img.size(0)
-        loss_G_GAN_Feat = torch.zeros(B, device=ori_img.device)
+        loss_G_GAN_Feat = 0
         D_weights = 1.0 / 2
         for i in range(2):
             for j in range(len(pred_fake[i]) - 1):
-                # 逐样本 L1，再在空间上平均 → [B]
-                feat_diff = criterionFeat(pred_fake[i][j], pred_real[i][j].detach())  # [B,C,H,W]
-                loss_G_GAN_Feat += D_weights * feat_diff.mean(dim=[1, 2, 3])
-
-        # 外部 VGG 特征
+                loss_G_GAN_Feat += D_weights * \
+                                   criterionFeat(pred_fake[i][j], pred_real[i][j].detach())
         ori_img = ori_img.expand(-1, 3, -1, -1)
         syn_img = syn_img.expand(-1, 3, -1, -1)
         feat_resize = nn.Upsample(size=(224, 224))
         feat_res_real = ext_discriminator(feat_resize(ori_img))
         feat_res_fake = ext_discriminator(feat_resize(syn_img))
-        loss_G_GAN_Feat_ext = torch.zeros(B, device=ori_img.device)
+        loss_G_GAN_Feat_ext = 0
         vgg_weights = [1.0 / 32, 1.0 / 16, 1.0 / 8, 1.0 / 4, 1.0]
-        for tmp_i in range(len(feat_res_fake)):
-            feat_diff = criterionFeat(feat_res_real[tmp_i].detach(), feat_res_fake[tmp_i])  # [B,C,H,W]
-            loss_G_GAN_Feat_ext += (feat_diff.mean(dim=[1, 2, 3]) * vgg_weights[tmp_i])
 
-        # 返回逐样本向量
+        for tmp_i in range(len(feat_res_fake)):
+            loss_G_GAN_Feat_ext += criterionFeat(feat_res_real[tmp_i].detach(), feat_res_fake[tmp_i]) * vgg_weights[tmp_i]
+
         return loss_G_GAN_Feat, loss_G_GAN_Feat_ext
     elif opt.dimension.startswith('3'):
         loss_G_GAN_Feat = 0

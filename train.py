@@ -1,7 +1,6 @@
 ### This code is largely borrowed from pix2pixHD pytorch implementation
 ### https://github.com/NVIDIA/pix2pixHD
-from collections import Counter
-import re
+
 import time
 import os
 import numpy as np
@@ -19,6 +18,20 @@ import util.util as util
 from util.visualizer import Visualizer
 from util.image_pool import ImagePool
 from models.networks import GANLoss, feature_loss, discriminate
+from models.networks import VGGLoss
+
+import importlib
+import shutil
+if shutil.which("npu-smi") and importlib.util.find_spec("torch_npu") is not None:
+    import torch_npu
+    from torch_npu.contrib import transfer_to_npu  
+    torch.npu.set_compile_mode(jit_compile=False)
+    torch.npu.config.allow_internal_format = False
+    
+import lightning as pl
+pl.seed_everything(42, workers=True)
+
+
 def lcm(a, b): return abs(a * b) / math.gcd(a, b) if a and b else 0
 
 ##############################################################################
@@ -39,7 +52,7 @@ def setup_ddp():
     
     if world_size > 1:
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend='nccl', init_method='env://')
+        dist.init_process_group(backend='hccl', init_method='env://')
     
     return rank, world_size, local_rank
 
@@ -85,22 +98,9 @@ data_loader = CreateDataLoader(opt)
 dataset = data_loader.load_data()
 dataset_size = len(data_loader)
 if is_main_process():
-    print('#training images = %d' % dataset_size)
-
-# ===== 统计 CP 比例 =====
-cp_labels = [data_loader.dataset.data_dicts[i].get('CP') if isinstance(data_loader.dataset.data_dicts[i], dict) else None for i in range(len(data_loader.dataset))]
-counts = Counter([c for c in cp_labels if c in (1, 2)])
-n1 = counts.get(1, 0)
-n2 = counts.get(2, 0)
-# 如果没有提供 csv（没有有效的 CP 标签），则按照 1:1 加权
-if n1 + n2 == 0:
-    lambda_cp1 = 0.5
-    lambda_cp2 = 0.5
-else:
-    lambda_cp1 = n2 / (n1 + n2)
-    lambda_cp2 = 1 - lambda_cp1
-if is_main_process():
-    print(f'[PTNet]  CP1:{n1}  CP2:{n2}  →  loss weight λ={lambda_cp1:.2f}')
+    print('#training batches per GPU = %d' % dataset_size)
+    print('#total global batch size = %d' % (opt.batchSize * world_size))
+    print('#total training samples = %d' % (dataset_size * opt.batchSize * world_size))
 # ========================
 
 ##############################################################################
@@ -116,7 +116,7 @@ ext_discriminator = ext_discriminator.to(device)
 # Wrap models with DDP
 if world_size > 1:
     PTNet = DDP(PTNet, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
-    D = DDP(D, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+    D = DDP(D, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     # ext_discriminator is usually frozen (VGG), no need to wrap if not training
     # If it needs gradients, wrap it too:
     # ext_discriminator = DDP(ext_discriminator, device_ids=[local_rank], output_device=local_rank)
@@ -130,16 +130,26 @@ optimizer_D = torch.optim.Adam(D.parameters(), lr=opt.lr, betas=(opt.beta1, 0.99
 fake_pool = ImagePool(0)
 
 CE = nn.CrossEntropyLoss()
-# Update: networks.GANLoss no longer accepts a `tensor=` argument. Use the new signature.
-criterionGAN = GANLoss(use_lsgan=True, reduction='none').to(device)
-mse = torch.nn.MSELoss(reduction='none')
+criterionGAN = GANLoss(use_lsgan=True, reduction='mean').to(device)
+mse = torch.nn.MSELoss(reduction='mean')
+mae = torch.nn.L1Loss(reduction='mean')
+smooth_l1 = torch.nn.SmoothL1Loss(reduction='mean')
+
+criterionVGG = VGGLoss(gpu_ids=opt.gpu_ids).to(device)  
+lambda_smooth_l1 = getattr(opt, 'lambda_smooth_l1')
+lambda_vgg = getattr(opt, 'lambda_vgg')  
+lambda_gan = getattr(opt, 'lambda_gan')
 
 # training/display parameter
 visualizer = Visualizer(opt) if is_main_process() else None
-total_steps = (start_epoch - 1) * dataset_size + epoch_iter
-display_delta = total_steps % opt.display_freq
-print_delta = total_steps % opt.print_freq
-save_delta = total_steps % opt.save_latest_freq
+
+steps_per_epoch = dataset_size  # 每个 epoch 的 step 数 = batch 数
+total_steps = (start_epoch - 1) * steps_per_epoch + (epoch_iter // (opt.batchSize * world_size))
+
+# 用于对齐打印频率的 delta 值
+display_delta = total_steps % opt.display_freq if opt.display_freq > 0 else 0
+print_delta = total_steps % opt.print_freq if opt.print_freq > 0 else 0
+save_delta = total_steps % opt.save_latest_freq if opt.save_latest_freq > 0 else 0
 
 ##############################################################################
 # Training code
@@ -150,23 +160,31 @@ D_module = D.module if hasattr(D, 'module') else D
 
 for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
     epoch_start_time = time.time()
+    if is_main_process():
+        visualizer.reset()
+    
+    # 每个 epoch 重置 epoch_iter（样本计数）
     if epoch != start_epoch:
-        epoch_iter = epoch_iter % dataset_size
+        epoch_iter = 0
     
     # Set epoch for DistributedSampler to shuffle data differently each epoch
-    if hasattr(data_loader, 'sampler') and hasattr(data_loader.sampler, 'set_epoch'):
+    if hasattr(data_loader, 'sampler') and isinstance(data_loader.sampler, torch.utils.data.distributed.DistributedSampler):
         data_loader.sampler.set_epoch(epoch)
-    elif hasattr(dataset, 'sampler') and hasattr(dataset.sampler, 'set_epoch'):
-        dataset.sampler.set_epoch(epoch)
+        
     
     for i, data in enumerate(dataset, start=epoch_iter):
-        if total_steps % opt.print_freq == print_delta:
-            iter_start_time = time.time()
-        total_steps += opt.batchSize * world_size  # Account for all GPUs
-        epoch_iter += opt.batchSize * world_size
+        iter_start_time = time.time()
+        
+        # 关键修复：step-based 计数
+        total_steps += 1
+        local_step = i + 1  # 当前 epoch 内的 step
+        
+        # 计算全局已处理样本数（用于显示）
+        global_samples_seen = (epoch - 1) * dataset_size * opt.batchSize * world_size + local_step * opt.batchSize * world_size
+        epoch_iter = local_step * opt.batchSize * world_size
 
         # whether to collect output images
-        save_fake = total_steps % opt.display_freq == display_delta
+        save_fake = total_steps % opt.display_freq == display_delta if opt.display_freq > 0 else False
 
         ##############################################################################
         # Forward Pass
@@ -174,29 +192,14 @@ for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
 
         input_image = Variable(data['img_A'].to(device))
         target_image = Variable(data['img_B'].to(device))
-        # prepare CP labels robustly (handle missing csv or None values)
-        batch_size = input_image.size(0)
-        raw_cp = data.get('CP', None)
-        if isinstance(raw_cp, torch.Tensor):
-            cp_tensor = raw_cp.to(device)
-        elif isinstance(raw_cp, (list, tuple)):
-            cp_list = [0 if c is None else c for c in raw_cp]
-            cp_tensor = torch.tensor(cp_list, dtype=torch.long, device=device)
-        elif raw_cp is None:
-            cp_tensor = torch.zeros(batch_size, dtype=torch.long, device=device)
-        else:
-            # scalar or other -> broadcast
-            cp_tensor = torch.full((batch_size,), int(raw_cp), dtype=torch.long, device=device)
-        cp_labels = Variable(cp_tensor)  # shape: (B,)
-        # create weight tensor using computed lambdas (use tensors on same device)
-        lambda_t1 = torch.tensor(lambda_cp1, dtype=torch.float32, device=device)
-        lambda_t2 = torch.tensor(lambda_cp2, dtype=torch.float32, device=device)
-        weight = torch.where(cp_labels == 1, lambda_t1, lambda_t2)  # shape: (B,)
-
+        
         # Synthesize and MSE loss
-        generated = PTNet(input_image)
-        loss_mse = mse(generated, target_image).flatten(1).mean(dim=1)  # shape: (B,)
+        generated = PTNet(input_image) # [B, C, H, W] or [B, C, D, H, W]
+        # loss_mse = mse(generated, target_image)
+        loss_smooth_l1 = smooth_l1(generated, target_image)
 
+        loss_vgg = criterionVGG(generated, target_image)
+        
         # Fake Detection and Loss
         pred_fake_pool = discriminate(D_module, fake_pool, input_image, generated, use_pool=True)
         loss_D_fake = criterionGAN(pred_fake_pool, False)
@@ -211,21 +214,20 @@ for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
 
         # GAN feature matching loss
         loss_G_GAN_Feat, loss_G_GAN_Feat_ext = feature_loss(opt, target_image, generated, pred_real, pred_fake,
-                                                            ext_discriminator, reduction='none')
+                                                            ext_discriminator)
 
         # Compute overall loss
-        loss_D = (loss_D_fake + loss_D_real).mean() * 0.5
-        loss_G = (loss_mse * weight).mean() * 100.0 + (loss_G_GAN * weight).mean() + (loss_G_GAN_Feat_ext * weight).mean() * 10.0 + (loss_G_GAN_Feat * weight).mean() * 10.0
-        # loss_G = loss_mse * 100.0 + loss_G_GAN + loss_G_GAN_Feat_ext * 10.0 + loss_G_GAN_Feat * 10.0
-        loss_dict = dict(
-            zip(['MSE', 'G_GAN', 'G_GAN_Feat_ext', 'G_GAN_Feat', 'D_fake', 'D_real'],
-                [loss_mse.mean().item(),
-                loss_G_GAN.mean().item(),
-                loss_G_GAN_Feat_ext.mean().item(),
-                loss_G_GAN_Feat.mean().item(),
-                loss_D_fake.mean().item(),
-                loss_D_real.mean().item()])
-        )
+        loss_D = (loss_D_fake + loss_D_real) * 0.5
+        loss_G = loss_smooth_l1 * lambda_smooth_l1 + loss_vgg * lambda_vgg + loss_G_GAN * lambda_gan + loss_G_GAN_Feat_ext + loss_G_GAN_Feat
+        loss_dict = {
+            'SMOOTH_L1': loss_smooth_l1.item(),
+            'VGG': loss_vgg.item(),
+            'G_GAN': loss_G_GAN.item(),
+            'G_GAN_Feat_ext': loss_G_GAN_Feat_ext.item(),
+            'G_GAN_Feat': loss_G_GAN_Feat.item(),
+            'D_fake': loss_D_fake.item(),
+            'D_real': loss_D_real.item()
+        }
         ##############################################################################
         # Backward
         ##############################################################################
@@ -243,22 +245,28 @@ for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
         ##############################################################################
         # Display results, print out loss, and save latest model
         ##############################################################################
-
+        
+        # 同步 loss 到所有卡（可选，为了打印更准确）
+        if world_size > 1:
+            for k in loss_dict:
+                tensor = torch.tensor(loss_dict[k], device=device)
+                dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+                loss_dict[k] = tensor.item() / world_size
+                
         # print out loss (only main process)
         if is_main_process() and total_steps % opt.print_freq == print_delta:
             errors = {k: v if not isinstance(v, int) else v for k, v in loss_dict.items()}
             t = (time.time() - iter_start_time) / opt.print_freq
-            visualizer.print_current_errors(epoch, epoch_iter, errors, t)
+            # 计算数据加载时间
+            t_data = 0  # 简化，或者你可以重新计算
+            visualizer.print_current_losses(epoch, epoch_iter, errors, t, t_data)
 
         # display output images (only main process)
         if is_main_process() and save_fake:
-            if 'label' in data:
-                visuals = OrderedDict([('input_label', util.tensor2label(data['label'][0, :, :, :, 15], opt.label_nc)),
-                                       ('synthesized_image', util.tensor2im(generated.data[0, :, :, :, 15])),
-                                       ('real_image', util.tensor2im(data['image'][0, :, :, :, 15]))])
-                visualizer.display_current_results(visuals, epoch, total_steps)
-            else:
-                print("Warning: 'label' key not found in data. Skipping visualization.")
+            visuals = OrderedDict([('input_image', util.tensor2im(input_image[0], normalize=True)),
+                                    ('target_image', util.tensor2im(target_image[0], normalize=True)),
+                                    ('synthesized_image', util.tensor2im(generated[0], normalize=True))])
+            visualizer.display_current_results(visuals, epoch, total_steps)
 
         # save latest model (only main process)
         if is_main_process() and total_steps % opt.save_latest_freq == save_delta:
@@ -294,13 +302,14 @@ for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
     # linearly decay learning rate after certain iterations
     if epoch > opt.niter:
         ler -= (opt.lr) / (opt.niter_decay)
+        ler = max(ler, 0)
         for param_group in optimizer_PTNet.param_groups:
             param_group['lr'] = ler
-            if is_main_process():
-                print('change lr to ')
-                print(param_group['lr'])
         for param_group in optimizer_D.param_groups:
             param_group['lr'] = ler
+        
+        if is_main_process():
+            print(f'Epoch {epoch}: Learning rate decayed to {ler:.6f}')
 
 # Clean up DDP
 cleanup_ddp()

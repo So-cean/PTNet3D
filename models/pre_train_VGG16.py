@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
-from torchvision.models import vgg19
+from torchvision.models import vgg19, VGG19_Weights
 
 
 class Vgg16(torch.nn.Module):
     def __init__(self):
         super(Vgg16, self).__init__()
-        features = list(vgg19(pretrained=True).features)[:33]
+        features = list(vgg19(weights=VGG19_Weights.DEFAULT).features)[:33]
         self.features = nn.ModuleList(features).eval()
 
     def forward(self, x):
@@ -18,3 +18,6 @@ class Vgg16(torch.nn.Module):
 
         return results
 
+if __name__ == '__main__':
+    vgg = Vgg16()
+    print(vgg)

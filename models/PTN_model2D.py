@@ -1,7 +1,7 @@
 # Copyright (c) 2021, Xuzhe Zhang, Xinzi He, Yun Wang
 # MIT License
 
-from timm.models.registry import register_model
+from timm.models import register_model
 from .transformer_block import Block, get_sinusoid_encoding, Unfold2D, Upfold2D
 from torch import nn
 import torch

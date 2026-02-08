@@ -17,7 +17,7 @@ import numpy as np
 import random
 
 import monai
-from monai.data import PersistentDataset 
+from monai.data import PersistentDataset, CacheDataset
 from monai.metrics import SSIMMetric
 from monai import transforms as monai_transforms
 from pathlib import Path
@@ -43,7 +43,7 @@ class AlignedDataset(BaseDataset):
 
         self.dataset_size = len(self.A_paths)
         
-        pix_dim = (0.8,0.8,-1)
+        pix_dim = (1,1,-1)
         self.transform = monai_transforms.Compose([
             monai_transforms.LoadImaged(keys=["A", "B"]),
             monai_transforms.EnsureChannelFirstd(keys=["A", "B"]),
@@ -56,55 +56,56 @@ class AlignedDataset(BaseDataset):
             monai_transforms.ScaleIntensityRangePercentilesd(keys=["A", "B"], lower=0, upper=self.opt.norm_perc, b_min=0, b_max=1, clip=True),
         ])
         self.data_dicts = [{'A': a, 'B': b} for a, b in zip(self.A_paths, self.B_paths)]
-        cache_dir = Path('./cache') / f'persistent_cache_{opt.phase}'
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        self.monai_ds = PersistentDataset(
+        # cache_dir = Path('./cache') / f'persistent_cache_{opt.phase}'
+        # cache_dir.mkdir(parents=True, exist_ok=True)
+        self.monai_ds = CacheDataset(
             data=self.data_dicts,
             transform=self.transform,
-            cache_dir=cache_dir,
+            # cache_dir=cache_dir,
+            cache_rate=1.0,
+            num_workers=4,
         )
+        self._calculate_valid_slices()
         
         self.ssim = SSIMMetric(data_range=1.0, spatial_dims=2)
         
-        # 1. 先建 sub→cp 映射
-        csv_path = os.path.join(self.opt.dataroot, 'data.csv')
-        sub2cp = {}
-        if os.path.exists(csv_path):
-            try:
-                df = pd.read_csv(csv_path)
-                if 'subject_id' in df.columns and 'CP' in df.columns:
-                    # convert CP to int when possible, otherwise treat as 0 (unknown)
-                    for sid, cpv in zip(df['subject_id'], df['CP']):
-                        try:
-                            sub2cp[sid] = int(cpv)
-                        except Exception:
-                            sub2cp[sid] = 0
-                else:
-                    # unexpected csv format -> leave mapping empty
-                    sub2cp = {}
-            except Exception:
-                # failed to read csv -> leave mapping empty
-                sub2cp = {}
-        else:
-            # csv not provided -> keep mapping empty, CP will be 0 (unknown)
-            sub2cp = {}
-
-        # 2. 遍历同序的 A_paths，在 **已有 dict 上追加** CP（确保为 int，避免 None 导致 collate 失败）
-        for i, a_path in enumerate(self.A_paths):
-            m = re.match(r'([A-Z]_\d+)_', os.path.basename(a_path))
-            sub_id = m.group(1) if m else None
-            cp = sub2cp.get(sub_id, 0)          # 缺省填 0（表示 unknown / 不使用加权）
-            try:
-                cp = int(cp)
-            except Exception:
-                cp = 0
-            self.data_dicts[i]['CP'] = cp       # ✅ 只追加，不改 A/B
+    def _calculate_valid_slices(self):
+        """Calculate the total number of valid slices for each domain."""
+        min_nonzero_pixels = 1000  # Minimum number of non-zero pixels to consider a slice valid
+        slice_list = []
+        slices_per_volume = {i: [] for i in range(len(self.monai_ds))}
+        
+        for volume_idx in range(len(self.monai_ds)):
+            volume_dict = self.monai_ds[volume_idx]
+            data_A = volume_dict["A"]  # shape: (C, H, W, D)
+            data_B = volume_dict["B"]
+            thresh_A = torch.quantile(data_A[data_A > 0], 0.001)  # 非零值的0.1%分位数
+            thresh_B = torch.quantile(data_B[data_B > 0], 0.001)
+            
+            mask_A = (data_A > thresh_A)
+            mask_B = (data_B > thresh_B)
+            mask_and = mask_A & mask_B
+            
+            # valid slices based on non-zero pixels in the AND mask
+            valid_z =[z for z in range(data_A.shape[-1]) if mask_and[..., z].sum().item() >= min_nonzero_pixels]
+            
+            if not valid_z:
+                valid_z = [data_A.shape[-1] // 2]
+                
+            slice_list.extend([(volume_idx, z) for z in valid_z])
+            slices_per_volume[volume_idx] = valid_z
+        
+        self.slices_per_volume = slices_per_volume
+        self.slice_list = slice_list
+        print(f'[AlignedDataset] {self.opt.phase} set: total volumes: {len(self.monai_ds)}, total valid slices: {len(self.slice_list)}')
 
     def __getitem__(self, index):
-        # 1. 加载数据
-        data = self.monai_ds[index]
-        tmpA: torch.Tensor = data["A"]  # shape: (C, H, W, D)
-        tmpB: torch.Tensor = data["B"]
+        # index is the slice index in the entire dataset
+        volume_idx, slice_idx = self.slice_list[index]
+        data_dict = self.monai_ds[volume_idx]
+        
+        tmpA: torch.Tensor = data_dict["A"]  # shape: (C, H, W, D)
+        tmpB: torch.Tensor = data_dict["B"]
         assert tmpA.shape == tmpB.shape, 'paired scans must have the same shape'
 
         # 3. 先得到前景边界（在 pad 之前做）
@@ -117,34 +118,33 @@ class AlignedDataset(BaseDataset):
 
         # 6. 采样
         if self.opt.dimension.startswith('2'):
-            max_retry = 20           # 防止无限循环
-            for _ in range(max_retry):
-                slice_idx = random.randrange(bound[-2], bound[-1])
-                slice_A = tmpA[..., slice_idx]          # (1, H, W)
-                slice_B = tmpB[..., slice_idx]
-
-                # 计算 mask 区域内的 SSIM
-                roi_A = slice_A[:, bound[0]:bound[1], bound[2]:bound[3]].unsqueeze(0)  # (1, C, H, W)
-                roi_B = slice_B[:, bound[0]:bound[1], bound[2]:bound[3]].unsqueeze(0)
-                ssim_val = self.ssim(roi_A, roi_B).item()
-                overlap = ((roi_A > 1e-4) & (roi_B > 1e-4)).sum().item() / max((roi_A > 1e-4).sum().item(), (roi_B > 1e-4).sum().item(), 1)
-                if ssim_val >= 0.7 and overlap >= 0.98:
-                    break
-            else:
-                # 重试用完仍不合格 → 强制取中间切片保底
-                slice_idx = (bound[-2] + bound[-1]) // 2
-                slice_A = tmpA[..., slice_idx]
-                slice_B = tmpB[..., slice_idx]
+            slice_A = tmpA[..., slice_idx]          # (1, H, W)
+            slice_B = tmpB[..., slice_idx]
+            thresh_A = torch.quantile(slice_A[slice_A > 0], 0.001)  # 非零值的0.1%分位数
+            thresh_B = torch.quantile(slice_B[slice_B > 0], 0.001)
+            
+            mask_A = (slice_A > thresh_A)
+            mask_B = (slice_B > thresh_B)
+            mask_and = mask_A & mask_B
+            slice_A = slice_A * mask_and
+            slice_B = slice_B * mask_and
+            roi_A = slice_A[:, bound[0]:bound[1], bound[2]:bound[3]].unsqueeze(0)  # (1, C, H, W)
+            roi_B = slice_B[:, bound[0]:bound[1], bound[2]:bound[3]].unsqueeze(0)
+            ssim_val = self.ssim(roi_A, roi_B).item()
             
             # print(f"using 2d, shape: {slice_A.shape}, {slice_B.shape}")
+            
+            # convert to [-1, 1]
+            slice_A = (slice_A * 2.0) - 1.0
+            slice_B = (slice_B * 2.0) - 1.0
 
             return {'img_A': slice_A, # (1, H, W)
                     'img_B': slice_B,
                     'ssim': ssim_val,
                     'slice_idx': slice_idx,
-                    'A_path': self.A_paths[index],
-                    'B_path': self.B_paths[index],
-                    'CP': self.data_dicts[index]['CP']}
+                    'A_path': self.A_paths[volume_idx],
+                    'B_path': self.B_paths[volume_idx],
+                    }
         
 
         elif self.opt.dimension.startswith('3'):
@@ -157,13 +157,21 @@ class AlignedDataset(BaseDataset):
                     'img_B': tmpB[:, x_idx:x_idx+x, y_idx:y_idx+y, z_idx:z_idx+z],
                     'A_path': self.A_paths[index],
                     'B_path': self.B_paths[index],
-                    'CP': self.data_dicts[index]['CP']}
-
-    def __len__(self):
-        return len(self.A_paths)
+                    }
 
     def name(self):
         return 'Paired/Aligned Dataset'
+    
+    @property
+    def num_volumes(self):
+        return len(self.A_paths)
+    
+    @property
+    def num_slices(self):
+        return len(self.slice_list)
+
+    def __len__(self):
+        return len(self.slice_list)
 
 
 def test():

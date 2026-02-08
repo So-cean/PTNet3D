@@ -53,13 +53,18 @@ class BaseOptions():
             if id >= 0:
                 self.opt.gpu_ids.append(id)
         
-        # For DDP, use LOCAL_RANK from environment if available
-        if 'LOCAL_RANK' in os.environ:
-            local_rank = int(os.environ['LOCAL_RANK'])
-            if len(self.opt.gpu_ids) > 0:
+        # 修复：检查CUDA是否可用，只在有GPU时设置设备[3,5](@ref)
+        if torch.cuda.is_available() and len(self.opt.gpu_ids) > 0:
+            # For DDP, use LOCAL_RANK from environment if available
+            if 'LOCAL_RANK' in os.environ:
+                local_rank = int(os.environ['LOCAL_RANK'])
                 torch.cuda.set_device(local_rank)
-        elif len(self.opt.gpu_ids) > 0:
-            torch.cuda.set_device(self.opt.gpu_ids[0])
+            else:
+                torch.cuda.set_device(self.opt.gpu_ids[0])
+        else:
+            # 如果没有GPU可用，清空gpu_ids并设置设备为CPU[1,2](@ref)
+            self.opt.gpu_ids = []
+            print("CUDA not available, using CPU instead.")
             
         assert self.opt.dimension in ['2D','3D','2d','3d'], 'dimension is not supported'
 

@@ -2,7 +2,7 @@ from functools import lru_cache
 import math
 import torch
 import torch.nn as nn
-from timm.models.layers import DropPath
+from timm.layers import DropPath
 from flash_attn import flash_attn_func
 
 # ---------- MLP ----------

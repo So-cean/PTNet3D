@@ -8,20 +8,35 @@ import torch
 import monai.transforms as monai_transforms
 from monai.metrics import PSNRMetric, SSIMMetric
 import SimpleITK as sitk
+import natsort
+
+import importlib
+import shutil
+
+if shutil.which("npu-smi") and importlib.util.find_spec("torch_npu") is not None:
+    import torch_npu
+    from torch_npu.contrib import transfer_to_npu  
+    torch.npu.set_compile_mode(jit_compile=False)
+    torch.npu.config.allow_internal_format = False
+    
+import lightning as pl
+pl.seed_everything(42, workers=True)
 
 opt = TestOptions().parse(save=False)
 
 PTNet, _, _ = create_model(opt)
-PTNet.cuda()
+device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+print(f'Using device: {device}')
+PTNet.to(device)
 PTNet.eval()
-PTNet.load_state_dict(torch.load(os.path.join(opt.checkpoints_dir, opt.name, opt.whichmodel)))
+PTNet.load_state_dict(torch.load(os.path.join(opt.checkpoints_dir, opt.name, opt.whichmodel), map_location=device))
 
 des = os.path.join(opt.dataroot, opt.name + '_' + opt.whichmodel)
 os.makedirs(des, exist_ok=True)
 
 # -----------  MONAI 2-D transform（与训练一致） -----------
-pix_dim = (0.8, 0.8, -1)
-# pix_dim = (1.0, 1.0, -1)
+# pix_dim = (0.8, 0.8, -1)
+pix_dim = (1.0, 1.0, -1)
 transform = monai_transforms.Compose([
     monai_transforms.LoadImaged(keys=["image"]),
     monai_transforms.EnsureChannelFirstd(keys=["image"]),
@@ -70,8 +85,12 @@ def inference_and_save(vol_path, prefix, save=True):
     pred_vol = np.zeros(vol_tensor[0].shape, dtype=np.float32)
     for z in range(vol_tensor.shape[-1]):
         slc = vol_tensor[..., z]                      # (1, H, W)
-        ipt = (slc.unsqueeze(0).to(dtype=torch.float32, device='cuda'))        # (1,1,H,W)
+        # convert to [-1,1]
+        slc = slc * 2.0 - 1.0
+        ipt = (slc.unsqueeze(0).to(dtype=torch.float32, device=device))        # (1,1,H,W)
         out = PTNet(ipt)
+        # convert out from [-1,1] back to [0,1]
+        out = (out + 1.0) / 2.0
         pred_vol[:, :, z] = torch.squeeze(out).detach().cpu().numpy()
 
     # # --- 使用 SimpleITK 做闭运算得到更稳健的 brain mask ---
@@ -86,8 +105,6 @@ def inference_and_save(vol_path, prefix, save=True):
 
     # # 设定闭运算半径（以 mm 为基准，转换为体素）；这里默认 5mm 的结构元素大小（仅在体素平面上主要作用）
     # rad_mm = 5.0
-    # # 取 in-plane 最小像素间距计算半径（避免 z 轴过度膨胀）
-    # px = max(pixdim[0], 1e-6); py = max(pixdim[1], 1e-6)
     # rad_x = max(1, int(round(rad_mm / px)))
     # rad_y = max(1, int(round(rad_mm / py)))
     # # 取较大值作为 scalar radius（SimpleITK 接受 scalar 半径）
@@ -104,40 +121,47 @@ def inference_and_save(vol_path, prefix, save=True):
     if save:    
         fake_nii = nib.Nifti1Image(pred_vol, affine)
         fake_nii.header.set_zooms(pixdim)
-        nib.save(fake_nii, os.path.join(des, f'{filename}_PTNetSynth_{prefix}'+opt.extension))
+        nib.save(fake_nii, os.path.join(des, f'{filename}_PTNetSynth'+opt.extension))
 
         # 保存 real（transform 后）
         real_nii = nib.Nifti1Image(vol_tensor[0].numpy(), affine)
         real_nii.header.set_zooms(pixdim)
-        nib.save(real_nii, os.path.join(des, f'{filename}__PTNetSynth_{prefix}'+opt.extension))
+        nib.save(real_nii, os.path.join(des, f'{filename}'+opt.extension))
 
     return vol_tensor[0], pred_vol  # 返回用于配对计算
 
 # -----------  1. external 推理（无 GT） -----------
 external_path = os.path.join(opt.dataroot, 'external')
 ext_lst = [i for i in os.listdir(external_path) if i.endswith(opt.extension)]
+ext_lst = natsort.natsorted(ext_lst)
+
 with torch.no_grad():
     for f in ext_lst:
-        inference_and_save(os.path.join(external_path, f), 'external')
+        inference_and_save(os.path.join(external_path, f), 'external', save=True)
 
 # -----------  2. test_A 推理 + 与 test_B 配对计算指标 -----------
 testA_path = os.path.join(opt.dataroot, 'test_A')
 testB_path = os.path.join(opt.dataroot, 'test_B')
 testA_lst = [i for i in os.listdir(testA_path) if i.endswith(opt.extension)]
+testB_lst = [i for i in os.listdir(testB_path) if i.endswith(opt.extension)]
+testA_lst = natsort.natsorted(testA_lst)
+testB_lst = natsort.natsorted(testB_lst)
 
 csv_f = open(os.path.join(des, 'metrics_testAB.csv'), 'w', newline='')
 writer = csv.writer(csv_f)
 writer.writerow(['file', 'PSNR', 'SSIM', 'MAE', 'MSE'])
 
 with torch.no_grad():
-    for fname in testA_lst:
-        gt_path = os.path.join(testB_path, fname)
+    for fileA, fileB in zip(testA_lst, testB_lst):
+        # fname use filaA and fileB same part 
+        gt_path = os.path.join(testB_path, fileB)
+        
         if not os.path.exists(gt_path):
-            print(f'Skip {fname}: no paired GT in test_B')
+            print(f'Skip {fileA}: no paired GT in test_B')
             continue
-
+         
         # 推理 testA 并拿到 fake
-        tensA, fake_vol = inference_and_save(os.path.join(testA_path, fname), 'A')
+        tensA, fake_vol = inference_and_save(os.path.join(testA_path, fileA), 'A')
         # 处理 GT
         tensB, _ = inference_and_save(gt_path, 'B', save=False)  # 仅为了保存 GT，不重复保存 fake
 
@@ -156,12 +180,12 @@ with torch.no_grad():
             psnr_l.append(p); ssim_l.append(s); mae_l.append(m); mse_l.append(ms)
             # print(f"p type : {type(p)}, s type: {type(s)}, m type: {type(m)}, ms type: {type(ms)}")
             
-        writer.writerow([fname,
+        writer.writerow([fileA,
                          np.mean(psnr_l),
                          np.mean(ssim_l),
                          np.mean(mae_l),
                          np.mean(mse_l)])
-        print(f'{fname}  PSNR={np.mean(psnr_l):.3f}  SSIM={np.mean(ssim_l):.3f}  '
+        print(f'{fileA}  PSNR={np.mean(psnr_l):.5f}  SSIM={np.mean(ssim_l):.5f}  '
               f'MAE={np.mean(mae_l):.4f}  MSE={np.mean(mse_l):.4f}')
 
 csv_f.close()

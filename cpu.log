@@ -1,0 +1,33 @@
+Mon Feb  9 00:37:33 CST 2026
+top - 00:37:33 up 392 days,  1:16,  2 users,  load average: 54.58, 54.46, 52.85
+Tasks: 2159 total,   3 running, 2156 sleeping,   0 stopped,   0 zombie
+%Cpu(s):  3.1 us,  0.9 sy,  0.0 ni, 96.0 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st
+MiB Mem : 1045781.+total, 397681.1 free, 131226.2 used, 516873.9 buff/cache
+MiB Swap:  55295.9 total,  33380.7 free,  21915.2 used. 768218.8 avail Mem 
+
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1708797 songhy2+  20   0 8204.0g   7.0g 830400 S  87.0   0.7  43:26.74 python3.11
+1708792 songhy2+  20   0 8204.2g   7.0g 830912 S  82.6   0.7  43:27.64 python3.11
+1708793 songhy2+  20   0 8204.0g   7.0g 830400 S  82.6   0.7  43:13.79 python3.11
+1708794 songhy2+  20   0 8204.0g   7.1g 830400 S  82.6   0.7  43:28.57 python3.11
+1708795 songhy2+  20   0 8204.0g   7.0g 830400 S  82.6   0.7  43:19.56 python3.11
+1708796 songhy2+  20   0 8204.0g   7.0g 830656 S  82.6   0.7  43:04.44 python3.11
+1708798 songhy2+  20   0 8204.0g   7.0g 830400 S  82.6   0.7  43:26.14 python3.11
+1708799 songhy2+  20   0 8203.9g   6.9g 830656 S  82.6   0.7  43:16.05 python3.11
+1160866 root       0 -20       0      0      0 R  21.7   0.0  21:06.76 kworker/u393:4+dev4_sq_send_wq
+1160926 root       0 -20       0      0      0 I  21.7   0.0  20:45.30 kworker/u393:5-dev3_sq_send_wq
+1711684 root       0 -20       0      0      0 I  21.7   0.0   7:57.02 kworker/u393:2-dev0_sq_send_wq
+1711685 root       0 -20       0      0      0 I  21.7   0.0   8:12.01 kworker/u393:3-dev7_sq_send_wq
+1713436 root       0 -20       0      0      0 I  21.7   0.0   8:05.46 kworker/u393:9-dev5_sq_send_wq
+1709627 root       0 -20       0      0      0 I  17.4   0.0   8:18.95 kworker/u393:0-dev3_sq_send_wq
+1711616 root       0 -20       0      0      0 I  17.4   0.0   8:39.93 kworker/u393:1-dev5_sq_send_wq
+1711687 root       0 -20       0      0      0 R  17.4   0.0   8:10.18 kworker/u393:7+dev4_sq_send_wq
+1711688 root       0 -20       0      0      0 I  17.4   0.0   8:00.65 kworker/u393:8-dev3_sq_send_wq
+2113262 songhy2+  20   0  243840  16640   5440 R   8.7   0.0   0:00.07 top
+ 428428 root      -2   0       0      0      0 D   4.3   0.0   1811:13 dev5_sq_task
+ 428575 root      -2   0       0      0      0 D   4.3   0.0   1758:29 dev7_sq_task
+      1 root      20   0  194176   9920   4864 S   0.0   0.0  48:56.62 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   2:08.18 kthreadd
+      3 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 rcu_gp
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 rcu_par_gp
+      6 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/0:0H-events_highpri
