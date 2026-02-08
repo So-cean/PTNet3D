@@ -6,3 +6,5 @@ checkpoints/
 slurm_logs/
 **/*.png
 */**/__pycache__
+slurm_logs
+kernel_meta
